@@ -63,4 +63,4 @@ src\Disnoy\bin\Release\net48\Disnoy.exe --write-icon src\Disnoy\Disnoy.ico
 
 ## License
 
-MIT
+GPL-3.0. You can use, change and share Disnoy, but if you distribute a modified version, its source has to be available under the same license. See [LICENSE](LICENSE).
