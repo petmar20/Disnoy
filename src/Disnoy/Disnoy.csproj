@@ -1,0 +1,24 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net48</TargetFramework>
+    <LangVersion>latest</LangVersion>
+    <RootNamespace>Disnoy</RootNamespace>
+    <AssemblyName>Disnoy</AssemblyName>
+    <ApplicationManifest>app.manifest</ApplicationManifest>
+    <ApplicationIcon Condition="Exists('Disnoy.ico')">Disnoy.ico</ApplicationIcon>
+    <Version>1.0.0</Version>
+    <Product>Disnoy</Product>
+    <AssemblyTitle>Disnoy</AssemblyTitle>
+    <Description>Puts windows back where they were when a display drops out and returns.</Description>
+    <Copyright>Copyright (c) 2026 Disnoy contributors</Copyright>
+    <GenerateDocumentationFile>false</GenerateDocumentationFile>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Reference Include="System.Windows.Forms" />
+    <Reference Include="System.Drawing" />
+  </ItemGroup>
+
+</Project>
