@@ -58,6 +58,16 @@ namespace Disnoy
         private TimeSpan missingWhileScreensOn;
         private DateTime? displaysBackAt;
 
+        // Some apps move their own windows a few seconds after a display returns,
+        // so restored windows are watched for a while and put back again if they drift.
+        private static readonly TimeSpan GuardTime = TimeSpan.FromSeconds(30);
+        private static readonly TimeSpan GuardStartDelay = TimeSpan.FromSeconds(2);
+        private const int MaxPutBacksDuringGuard = 2;
+        private DateTime? guardUntil;
+        private DateTime guardStartsAt;
+        private readonly Dictionary<IntPtr, int> guardPutBacks = new Dictionary<IntPtr, int>();
+        private readonly HashSet<IntPtr> guardGaveUp = new HashSet<IntPtr>();
+
         public bool ScreensOn { get; set; } = true;
         public bool RefreshTaskbarButtons { get; set; } = true;
 
@@ -85,6 +95,7 @@ namespace Disnoy
                 // Start from the current arrangement when resuming.
                 displayMissing = false;
                 displaysBackAt = null;
+                guardUntil = null;
                 fullDisplayCount = 0;
                 fullArrangement = null;
                 AddActivity(paused ? "Paused." : "Resumed.");
@@ -114,13 +125,23 @@ namespace Disnoy
                     if (fullArrangement != null && arrangement != fullArrangement)
                     {
                         AddActivity("Displays changed. Using the new arrangement.");
+                        guardUntil = null;
                     }
                     fullDisplayCount = current.Count;
                     fullArrangement = arrangement;
-                    SaveWindows(arrangement);
+                    if (guardUntil != null)
+                    {
+                        GuardRestoredWindows(now);
+                    }
+                    else
+                    {
+                        SaveWindows(arrangement);
+                    }
                 }
                 else
                 {
+                    // Not saved during the guard, so the layout held is still the one from before.
+                    guardUntil = null;
                     displayMissing = true;
                     missingWhileScreensOn = TimeSpan.Zero;
                     displaysBackAt = null;
@@ -267,67 +288,30 @@ namespace Disnoy
         {
             var restoredTitles = new List<string>();
             var minimizedToRefresh = new List<IntPtr>();
-            var expectedDisplays = new Dictionary<IntPtr, string>();
 
             foreach (KeyValuePair<IntPtr, SavedWindow> entry in savedWindows)
             {
                 IntPtr hwnd = entry.Key;
                 SavedWindow saved = entry.Value;
-                if (!Native.IsWindow(hwnd) || AppWindows.ProcessId(hwnd) != saved.ProcessId)
-                {
-                    continue;
-                }
-                if (!AppWindows.TryGetPlacement(hwnd, out Native.WINDOWPLACEMENT now))
+                if (!IsSameWindow(hwnd, saved) || !AppWindows.TryGetPlacement(hwnd, out Native.WINDOWPLACEMENT now))
                 {
                     continue;
                 }
 
-                string savedState = StateOf(saved.Placement.showCmd);
-                bool unchanged = StateOf(now.showCmd) == savedState
+                bool unchanged = StateOf(now.showCmd) == StateOf(saved.Placement.showCmd)
                     && SameRect(now.rcNormalPosition, saved.Placement.rcNormalPosition);
                 if (unchanged)
                 {
                     continue;
                 }
 
-                Native.WINDOWPLACEMENT target = saved.Placement;
-                target.flags |= Native.WPF_ASYNCWINDOWPLACEMENT;
-
-                // Windows won't move a maximized window to another display, so un-maximize it there first.
-                if (savedState == "maximized" && StateOf(now.showCmd) == "maximized")
-                {
-                    Native.WINDOWPLACEMENT unmaximize = target;
-                    unmaximize.showCmd = Native.SW_SHOWNOACTIVATE;
-                    Native.SetWindowPlacement(hwnd, ref unmaximize);
-                }
-
-                if (savedState == "minimized")
-                {
-                    target.showCmd = Native.SW_SHOWMINNOACTIVE;
-                }
-                else if (savedState == "maximized")
-                {
-                    target.showCmd = Native.SW_SHOWMAXIMIZED;
-                }
-                else
-                {
-                    target.showCmd = Native.SW_SHOWNOACTIVATE;
-                }
-
-                if (Native.SetWindowPlacement(hwnd, ref target))
+                if (PutBack(hwnd, saved, now))
                 {
                     restoredTitles.Add(AppWindows.ShortTitle(hwnd));
-                    expectedDisplays[hwnd] = saved.Display;
-                    Log.Write(string.Format("  put back on {0}{1}  {2}",
-                        saved.Display, savedState == "normal" ? "" : " (" + savedState + ")", AppWindows.Describe(hwnd)));
-                    if (savedState == "minimized")
+                    if (StateOf(saved.Placement.showCmd) == "minimized")
                     {
                         minimizedToRefresh.Add(hwnd);
                     }
-                }
-                else
-                {
-                    Log.Write("  could not put back  " + AppWindows.Describe(hwnd));
                 }
             }
 
@@ -348,29 +332,94 @@ namespace Disnoy
                 // Give the async placements a moment to land first.
                 RefreshButtonsInBackground(minimizedToRefresh, TimeSpan.FromMilliseconds(500));
             }
-            CheckRestoredInBackground(expectedDisplays);
+
+            guardPutBacks.Clear();
+            guardGaveUp.Clear();
+            guardStartsAt = DateTime.Now + GuardStartDelay;
+            guardUntil = DateTime.Now + GuardTime;
         }
 
-        // Logs any window that isn't on the display it was put back on, a few seconds later.
-        private static void CheckRestoredInBackground(Dictionary<IntPtr, string> expectedDisplays)
+        private bool PutBack(IntPtr hwnd, SavedWindow saved, Native.WINDOWPLACEMENT now)
         {
-            Task.Run(() =>
+            string savedState = StateOf(saved.Placement.showCmd);
+            Native.WINDOWPLACEMENT target = saved.Placement;
+            target.flags |= Native.WPF_ASYNCWINDOWPLACEMENT;
+
+            // Windows won't move a maximized window to another display, so un-maximize it there first.
+            if (savedState == "maximized" && StateOf(now.showCmd) == "maximized")
             {
-                Thread.Sleep(TimeSpan.FromSeconds(3));
-                foreach (KeyValuePair<IntPtr, string> entry in expectedDisplays)
+                Native.WINDOWPLACEMENT unmaximize = target;
+                unmaximize.showCmd = Native.SW_SHOWNOACTIVATE;
+                Native.SetWindowPlacement(hwnd, ref unmaximize);
+            }
+
+            if (savedState == "minimized")
+            {
+                target.showCmd = Native.SW_SHOWMINNOACTIVE;
+            }
+            else if (savedState == "maximized")
+            {
+                target.showCmd = Native.SW_SHOWMAXIMIZED;
+            }
+            else
+            {
+                target.showCmd = Native.SW_SHOWNOACTIVATE;
+            }
+
+            if (!Native.SetWindowPlacement(hwnd, ref target))
+            {
+                Log.Write("  could not put back  " + AppWindows.Describe(hwnd));
+                return false;
+            }
+            Log.Write(string.Format("  put back on {0}{1}  {2}",
+                saved.Display, savedState == "normal" ? "" : " (" + savedState + ")", AppWindows.Describe(hwnd)));
+            return true;
+        }
+
+        // Puts back windows that moved to another display after being restored. Runs each poll during the guard.
+        private void GuardRestoredWindows(DateTime now)
+        {
+            bool lastCheck = now >= guardUntil.Value;
+            if (now >= guardStartsAt)
+            {
+                foreach (KeyValuePair<IntPtr, SavedWindow> entry in savedWindows)
                 {
-                    if (!Native.IsWindow(entry.Key))
+                    IntPtr hwnd = entry.Key;
+                    SavedWindow saved = entry.Value;
+                    if (!IsSameWindow(hwnd, saved) || Displays.NameOfWindowDisplay(hwnd) == saved.Display)
                     {
                         continue;
                     }
-                    string actual = Displays.NameOfWindowDisplay(entry.Key);
-                    if (actual != entry.Value)
+
+                    guardPutBacks.TryGetValue(hwnd, out int count);
+                    if (lastCheck || count >= MaxPutBacksDuringGuard)
                     {
-                        Log.Write(string.Format("  did not stay on {0}, it's on {1}  {2}",
-                            entry.Value, actual, AppWindows.Describe(entry.Key)));
+                        if (guardGaveUp.Add(hwnd))
+                        {
+                            Log.Write(string.Format("  did not stay on {0}, it's on {1}  {2}",
+                                saved.Display, Displays.NameOfWindowDisplay(hwnd), AppWindows.Describe(hwnd)));
+                        }
+                        continue;
+                    }
+
+                    if (AppWindows.TryGetPlacement(hwnd, out Native.WINDOWPLACEMENT placement))
+                    {
+                        Log.Write("  moved off " + saved.Display + " again  " + AppWindows.Describe(hwnd));
+                        PutBack(hwnd, saved, placement);
+                        guardPutBacks[hwnd] = count + 1;
                     }
                 }
-            });
+            }
+
+            if (lastCheck)
+            {
+                guardUntil = null;
+            }
+        }
+
+        private static bool IsSameWindow(IntPtr hwnd, SavedWindow saved)
+        {
+            return Native.IsWindow(hwnd) && AppWindows.ProcessId(hwnd) == saved.ProcessId;
         }
 
         private static void RefreshButtonsInBackground(List<IntPtr> windows, TimeSpan delay)
