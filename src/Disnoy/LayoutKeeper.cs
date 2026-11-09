@@ -267,6 +267,7 @@ namespace Disnoy
         {
             var restoredTitles = new List<string>();
             var minimizedToRefresh = new List<IntPtr>();
+            var expectedDisplays = new Dictionary<IntPtr, string>();
 
             foreach (KeyValuePair<IntPtr, SavedWindow> entry in savedWindows)
             {
@@ -291,6 +292,15 @@ namespace Disnoy
 
                 Native.WINDOWPLACEMENT target = saved.Placement;
                 target.flags |= Native.WPF_ASYNCWINDOWPLACEMENT;
+
+                // Windows won't move a maximized window to another display, so un-maximize it there first.
+                if (savedState == "maximized" && StateOf(now.showCmd) == "maximized")
+                {
+                    Native.WINDOWPLACEMENT unmaximize = target;
+                    unmaximize.showCmd = Native.SW_SHOWNOACTIVATE;
+                    Native.SetWindowPlacement(hwnd, ref unmaximize);
+                }
+
                 if (savedState == "minimized")
                 {
                     target.showCmd = Native.SW_SHOWMINNOACTIVE;
@@ -307,6 +317,7 @@ namespace Disnoy
                 if (Native.SetWindowPlacement(hwnd, ref target))
                 {
                     restoredTitles.Add(AppWindows.ShortTitle(hwnd));
+                    expectedDisplays[hwnd] = saved.Display;
                     Log.Write(string.Format("  put back on {0}{1}  {2}",
                         saved.Display, savedState == "normal" ? "" : " (" + savedState + ")", AppWindows.Describe(hwnd)));
                     if (savedState == "minimized")
@@ -337,6 +348,29 @@ namespace Disnoy
                 // Give the async placements a moment to land first.
                 RefreshButtonsInBackground(minimizedToRefresh, TimeSpan.FromMilliseconds(500));
             }
+            CheckRestoredInBackground(expectedDisplays);
+        }
+
+        // Logs any window that isn't on the display it was put back on, a few seconds later.
+        private static void CheckRestoredInBackground(Dictionary<IntPtr, string> expectedDisplays)
+        {
+            Task.Run(() =>
+            {
+                Thread.Sleep(TimeSpan.FromSeconds(3));
+                foreach (KeyValuePair<IntPtr, string> entry in expectedDisplays)
+                {
+                    if (!Native.IsWindow(entry.Key))
+                    {
+                        continue;
+                    }
+                    string actual = Displays.NameOfWindowDisplay(entry.Key);
+                    if (actual != entry.Value)
+                    {
+                        Log.Write(string.Format("  did not stay on {0}, it's on {1}  {2}",
+                            entry.Value, actual, AppWindows.Describe(entry.Key)));
+                    }
+                }
+            });
         }
 
         private static void RefreshButtonsInBackground(List<IntPtr> windows, TimeSpan delay)
