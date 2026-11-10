@@ -50,7 +50,11 @@ namespace Disnoy
         public const int SW_MINIMIZE = 6;
         public const int SW_SHOWMINNOACTIVE = 7;
 
+        public const int WPF_RESTORETOMAXIMIZED = 0x2;
         public const int WPF_ASYNCWINDOWPLACEMENT = 0x4;
+        public const uint SWP_NOZORDER = 0x4;
+        public const uint SWP_NOACTIVATE = 0x10;
+        public const uint SWP_ASYNCWINDOWPOS = 0x4000;
         public const int MONITORINFOF_PRIMARY = 0x1;
         public const uint MONITOR_DEFAULTTONEAREST = 2;
         public const uint GW_OWNER = 4;
@@ -108,6 +112,12 @@ namespace Disnoy
 
         [DllImport("user32.dll")]
         public static extern bool ShowWindowAsync(IntPtr hwnd, int command);
+
+        [DllImport("user32.dll")]
+        public static extern bool SetWindowPos(IntPtr hwnd, IntPtr insertAfter, int x, int y, int width, int height, uint flags);
+
+        [DllImport("user32.dll")]
+        public static extern bool IsZoomed(IntPtr hwnd);
 
         [DllImport("dwmapi.dll")]
         public static extern int DwmGetWindowAttribute(IntPtr hwnd, int attribute, out int value, int size);

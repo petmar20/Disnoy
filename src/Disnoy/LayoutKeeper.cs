@@ -68,6 +68,9 @@ namespace Disnoy
         private readonly Dictionary<IntPtr, int> guardPutBacks = new Dictionary<IntPtr, int>();
         private readonly HashSet<IntPtr> guardGaveUp = new HashSet<IntPtr>();
 
+        private readonly Dictionary<IntPtr, DateTime> lastSelfMoveFix = new Dictionary<IntPtr, DateTime>();
+        private int forcePutBacksRunning;
+
         public bool ScreensOn { get; set; } = true;
         public bool RefreshTaskbarButtons { get; set; } = true;
 
@@ -122,18 +125,24 @@ namespace Disnoy
             {
                 if (current.Count >= fullDisplayCount)
                 {
-                    if (fullArrangement != null && arrangement != fullArrangement)
+                    bool sameArrangement = arrangement == fullArrangement;
+                    if (fullArrangement != null && !sameArrangement)
                     {
                         AddActivity("Displays changed. Using the new arrangement.");
                         guardUntil = null;
                     }
                     fullDisplayCount = current.Count;
                     fullArrangement = arrangement;
-                    if (guardUntil != null)
+
+                    if (Volatile.Read(ref forcePutBacksRunning) > 0)
+                    {
+                        // Wait, so a window isn't saved halfway through being put back.
+                    }
+                    else if (guardUntil != null)
                     {
                         GuardRestoredWindows(now);
                     }
-                    else
+                    else if (!(sameArrangement && PutBackSelfMovedMinimizedWindows(now)))
                     {
                         SaveWindows(arrangement);
                     }
@@ -402,12 +411,9 @@ namespace Disnoy
                         continue;
                     }
 
-                    if (AppWindows.TryGetPlacement(hwnd, out Native.WINDOWPLACEMENT placement))
-                    {
-                        Log.Write("  moved off " + saved.Display + " again  " + AppWindows.Describe(hwnd));
-                        PutBack(hwnd, saved, placement);
-                        guardPutBacks[hwnd] = count + 1;
-                    }
+                    Log.Write("  moved off " + saved.Display + " again  " + AppWindows.Describe(hwnd));
+                    ForcePutBackInBackground(hwnd, saved);
+                    guardPutBacks[hwnd] = count + 1;
                 }
             }
 
@@ -415,6 +421,88 @@ namespace Disnoy
             {
                 guardUntil = null;
             }
+        }
+
+        // Nobody can drag a minimized window, so one that changes display while the displays stay put was moved by its app.
+        private bool PutBackSelfMovedMinimizedWindows(DateTime now)
+        {
+            bool started = false;
+            foreach (KeyValuePair<IntPtr, SavedWindow> entry in savedWindows)
+            {
+                IntPtr hwnd = entry.Key;
+                SavedWindow saved = entry.Value;
+                if (!IsSameWindow(hwnd, saved) || !Native.IsIconic(hwnd))
+                {
+                    continue;
+                }
+                string display = Displays.NameOfWindowDisplay(hwnd);
+                if (display == saved.Display)
+                {
+                    continue;
+                }
+                // Don't fight an app that keeps doing it.
+                if (lastSelfMoveFix.TryGetValue(hwnd, out DateTime last) && now - last < TimeSpan.FromMinutes(1))
+                {
+                    continue;
+                }
+                lastSelfMoveFix[hwnd] = now;
+                Log.Write(string.Format("  moved itself to {0} while minimized, putting it back on {1}  {2}",
+                    display, saved.Display, AppWindows.Describe(hwnd)));
+                ForcePutBackInBackground(hwnd, saved);
+                started = true;
+            }
+            return started;
+        }
+
+        // Some apps (Zulip, for one) ignore SetWindowPlacement but follow a plain move while showing and not maximized.
+        private void ForcePutBackInBackground(IntPtr hwnd, SavedWindow saved)
+        {
+            Interlocked.Increment(ref forcePutBacksRunning);
+            Task.Run(() =>
+            {
+                try
+                {
+                    Native.RECT rect = saved.Placement.rcNormalPosition;
+                    int width = rect.Right - rect.Left;
+                    int height = rect.Bottom - rect.Top;
+                    string state = StateOf(saved.Placement.showCmd);
+                    bool restoreToMaximized = (saved.Placement.flags & Native.WPF_RESTORETOMAXIMIZED) != 0;
+                    const uint moveFlags = Native.SWP_NOZORDER | Native.SWP_NOACTIVATE | Native.SWP_ASYNCWINDOWPOS;
+
+                    for (int i = 0; i < 2 && (Native.IsIconic(hwnd) || Native.IsZoomed(hwnd)); i++)
+                    {
+                        Native.ShowWindowAsync(hwnd, Native.SW_SHOWNOACTIVATE);
+                        Thread.Sleep(150);
+                    }
+
+                    // The second move fixes the size, which can change when the display's scaling differs.
+                    Native.SetWindowPos(hwnd, IntPtr.Zero, rect.Left, rect.Top, width, height, moveFlags);
+                    Thread.Sleep(150);
+                    Native.SetWindowPos(hwnd, IntPtr.Zero, rect.Left, rect.Top, width, height, moveFlags);
+                    Thread.Sleep(150);
+
+                    if (state == "maximized")
+                    {
+                        Native.ShowWindowAsync(hwnd, Native.SW_SHOWMAXIMIZED);
+                    }
+                    else if (state == "minimized")
+                    {
+                        Native.ShowWindowAsync(hwnd, Native.SW_SHOWMINNOACTIVE);
+                        Thread.Sleep(150);
+                        if (restoreToMaximized && AppWindows.TryGetPlacement(hwnd, out Native.WINDOWPLACEMENT placement))
+                        {
+                            placement.flags = Native.WPF_RESTORETOMAXIMIZED | Native.WPF_ASYNCWINDOWPLACEMENT;
+                            placement.showCmd = Native.SW_SHOWMINNOACTIVE;
+                            Native.SetWindowPlacement(hwnd, ref placement);
+                        }
+                    }
+                    Thread.Sleep(300);
+                }
+                finally
+                {
+                    Interlocked.Decrement(ref forcePutBacksRunning);
+                }
+            });
         }
 
         private static bool IsSameWindow(IntPtr hwnd, SavedWindow saved)
